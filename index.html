@@ -3505,19 +3505,49 @@ window.TOPICS['v1p5'] = {
     if (store.history.length > 800) store.history = store.history.slice(-800);
     save();
   }
+  // Отправка: сервер отвечает «ok N». Если ответа нет или он другой — запись остаётся в очереди
+  // и уходит позже; по rid сервер отбрасывает повторы, поэтому повторная отправка безопасна.
+  const SENT_MODES = ['test', 'train', 'mistakes', 'final'];
+  const SYNC_V = 5;
+  const ridOf = (p) => `${p.uid || 'x'}:${p.mode}:${p.ts}`;
+  const withUser = (rec) => { const p = Object.assign({}, rec, { name: store.user.name, group: store.user.group, uid: store.user.uid }); p.rid = ridOf(p); return p; };
+  store.pending = (store.pending || []).filter((p) => p && p.name);
+  store.pending.forEach((p) => { if (!p.rid) p.rid = ridOf(p); });
   function sendResult(rec) {
-    if (!store.user || !store.user.name) return Promise.resolve('anon');
-    const payload = Object.assign({ name: store.user.name, group: store.user.group, uid: store.user.uid }, rec);
+    if (!registered()) return Promise.resolve('anon');
     if (!CFG.STATS_URL) return Promise.resolve('local');
-    return postPayload(payload).then(() => 'sent').catch(() => { store.pending.push(payload); save(); return 'queued'; });
+    const payload = withUser(rec);
+    return postBatch([payload]).then(() => { flushPending(); return 'sent'; }).catch(() => { enqueue([payload]); return 'queued'; });
   }
-  function postPayload(p) {
-    return fetch(CFG.STATS_URL, { method: 'POST', mode: 'no-cors', headers: { 'Content-Type': 'text/plain;charset=utf-8' }, body: JSON.stringify(p) });
+  function enqueue(list) {
+    const have = new Set(store.pending.map((p) => p.rid));
+    list.forEach((p) => { if (!have.has(p.rid)) { store.pending.push(p); have.add(p.rid); } });
+    if (store.pending.length > 600) store.pending = store.pending.slice(-600);
+    save();
   }
+  function postBatch(list) {
+    const body = JSON.stringify(list.length === 1 ? list[0] : { batch: list });
+    return fetch(CFG.STATS_URL, { method: 'POST', headers: { 'Content-Type': 'text/plain;charset=utf-8' }, body })
+      .then((r) => r.text()).then((t) => { if (!/^ok\b/.test(t)) throw new Error(t.slice(0, 80)); return t; });
+  }
+  let flushing = false;
   function flushPending() {
-    if (!CFG.STATS_URL || !store.pending.length || !navigator.onLine) return;
-    const batch = store.pending.slice(); store.pending = []; save();
-    batch.forEach((p) => postPayload(p).catch(() => { store.pending.push(p); save(); }));
+    if (flushing || !CFG.STATS_URL || !store.pending.length || navigator.onLine === false) return;
+    flushing = true;
+    const batch = store.pending.slice(0, 40);
+    postBatch(batch).then(() => {
+      const done = new Set(batch.map((p) => p.rid));
+      store.pending = store.pending.filter((p) => !done.has(p.rid)); save();
+      flushing = false; if (store.pending.length) flushPending();
+    }).catch(() => { flushing = false; });
+  }
+  // Один раз переотправить регистрацию и всю историю: раньше сайт не знал, дошли ли данные.
+  function resyncOnce() {
+    if (!registered() || !CFG.STATS_URL || store.syncV >= SYNC_V) return;
+    const u = store.user;
+    const reg = { topic: '-', mode: 'register', score: 0, total: 0, errors: '', detail: '', duration: 0, ts: u.registeredAt || new Date().toISOString() };
+    enqueue([reg].concat(store.history.filter((r) => SENT_MODES.includes(r.mode) && r.total > 0)).map(withUser));
+    store.syncV = SYNC_V; save();
   }
 
   /* ---------- Пользователь ---------- */
@@ -3560,15 +3590,14 @@ window.TOPICS['v1p5'] = {
     if (!pendingUser) return;
     store.user = Object.assign(pendingUser, { uid: (store.user && store.user.uid) || uid(), registeredAt: new Date().toISOString() });
     save(); $modal.hidden = true; renderChip();
-    sendResult({ topic: '-', mode: 'register', score: 0, total: 0, errors: '', detail: '', duration: 0, ts: store.user.registeredAt });
-    flushPending(); route();
+    store.syncV = 0; resyncOnce(); flushPending(); route();
     toast(`Добро пожаловать, ${store.user.name.split(' ')[1]}! Профиль создан.`);
   });
   document.getElementById('anonBtn').addEventListener('click', () => { store.user = { name: '', group: '', uid: (store.user && store.user.uid) || uid() }; save(); $modal.hidden = true; renderChip(); });
   // профили из прошлой версии: присвоить идентификатор и сообщить преподавателю о регистрации
   if (registered() && !store.user.uid) {
     store.user.uid = uid(); store.user.registeredAt = new Date().toISOString(); save();
-    setTimeout(() => sendResult({ topic: '-', mode: 'register', score: 0, total: 0, errors: '', detail: '', duration: 0, ts: store.user.registeredAt }), 0);
+    store.syncV = 0;
   }
   $chip.addEventListener('click', () => { if (!store.user) askUser(); else location.hash = '/profile'; });
 
@@ -4054,7 +4083,7 @@ window.TOPICS['v1p5'] = {
       document.getElementById('againBtn').onclick = () => viewSession(topic, info, mode);
       document.getElementById('bar').style.width = '100%';
       sendResult(rec).then((s) => {
-        const msg = { sent: 'Результат отправлен преподавателю.', queued: 'Нет связи — результат будет отправлен позже.',
+        const msg = { sent: 'Результат отправлен преподавателю.', queued: 'Не удалось связаться с сервером — результат сохранён и будет отправлен автоматически.',
           local: 'Результат сохранён в вашем профиле.', anon: 'Вы занимаетесь без имени — результат сохранён только в этом браузере.' }[s];
         const el = document.getElementById('sent'); if (el) el.textContent = msg;
       });
@@ -4224,7 +4253,11 @@ window.TOPICS['v1p5'] = {
   window.addEventListener('hashchange', route);
   window.addEventListener('online', flushPending);
 
+  document.addEventListener('visibilitychange', () => { if (!document.hidden) flushPending(); });
+  setInterval(flushPending, 120000);
+
   route();
+  resyncOnce();
   flushPending();
   if (!store.user) askUser();
 })();

@@ -2,6 +2,7 @@
 <html lang="ru">
 <head>
 <meta charset="utf-8">
+<meta name="robots" content="noindex, nofollow">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Результаты учеников · Тренажёр</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -527,7 +528,7 @@ a.step { text-decoration: none; transition: border-color .15s; } a.step:hover { 
 .filters { display: flex; gap: 12px; flex-wrap: wrap; align-items: end; margin: 8px 0 20px; }
 .filters label { font-size: 14px; font-weight: 600; color: var(--muted); display: flex; flex-direction: column; gap: 6px; }
 .filters select { font: inherit; color: var(--ink); padding: 9px 12px; border-radius: 12px; border: 1px solid var(--line); background: var(--surface); min-width: 170px; }
-.filters .btn { margin-left: auto; }
+.filters #csvBtn { margin-left: auto; }
 .tiles { grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); }
 .tile .v { font-size: 30px; }
 .grid2 { grid-template-columns: 1.4fr 1fr; }
@@ -570,10 +571,12 @@ a.step { text-decoration: none; transition: border-color .15s; } a.step:hover { 
 <main class="main t-main" id="tmain">
   <form class="card t-login" id="keyForm">
     <h2>Вход для преподавателя</h2>
-    <p class="muted">Введите ключ доступа, который вы задали в Google Apps Script (README, шаг 2).</p>
-    <input name="key" type="password" placeholder="Ключ доступа" autocomplete="current-password">
+    <p class="muted">Введите пароль преподавателя. Он хранится только в настройках Google Apps Script, поэтому без него результаты учеников никто не увидит.</p>
+    <input name="username" type="text" value="Преподаватель" autocomplete="username" hidden>
+    <input name="key" type="password" placeholder="Пароль" autocomplete="current-password" aria-label="Пароль">
     <div class="modal-actions">
-      <button class="btn primary" type="submit">Показать результаты</button>
+      <button class="btn primary" type="submit">Войти</button>
+      <button class="btn ghost" type="button" id="pingBtn">Проверить подключение</button>
       <button class="btn ghost" type="button" id="demoBtn">Демо-данные</button>
     </div>
     <p class="small muted" id="keyMsg"></p>
@@ -3467,15 +3470,40 @@ window.TOPICS['v1p5'] = {
   const $report = document.getElementById('report');
   const $msg = document.getElementById('keyMsg');
 
+  // Пароль уходит в теле POST-запроса (не в адресе) и проверяется только на сервере Google.
+  const asJson = (r) => r.text().then((t) => { try { return JSON.parse(t); } catch (e) { const er = new Error('notjson'); er.text = t; throw er; } });
+  const NO_URL = 'Адрес Google Apps Script ещё не указан (STATS_URL) — откройте демо-данные или настройте сбор результатов по инструкции.';
+  const NO_LINK = 'Нет ответа от сервера. Обычно это значит, что в развертывании Apps Script выбран доступ не «Все» или адрес STATS_URL неверный. Нажмите «Проверить подключение».';
+  const OLD = 'На сервере старая версия Code.gs. Вставьте новый код и сделайте новую версию: Развертывание → Управление развертываниями → ✎ → Новая версия.';
   document.getElementById('keyForm').addEventListener('submit', (e) => {
     e.preventDefault();
-    const key = new FormData(e.target).get('key');
-    if (!CFG.STATS_URL) { $msg.textContent = 'Адрес Google Apps Script ещё не указан (STATS_URL) — откройте демо-данные или настройте сбор результатов по инструкции.'; return; }
-    $msg.textContent = 'Загрузка…';
-    fetch(`${CFG.STATS_URL}?key=${encodeURIComponent(key)}`).then((r) => r.json()).then((d) => {
-      if (d.error) { $msg.textContent = 'Неверный ключ доступа.'; return; }
-      rows = (d.rows || []).map(normalize).filter((r) => r.name); demo = false; show();
-    }).catch(() => { $msg.textContent = 'Не удалось загрузить данные. Проверьте адрес STATS_URL и доступ к веб-приложению («Все»).'; });
+    const input = e.target.elements.key;
+    const password = input.value;
+    if (!CFG.STATS_URL) { $msg.textContent = NO_URL; return; }
+    if (!password) { $msg.textContent = 'Введите пароль.'; return; }
+    $msg.textContent = 'Проверка пароля…';
+    fetch(CFG.STATS_URL, { method: 'POST', headers: { 'Content-Type': 'text/plain;charset=utf-8' }, body: JSON.stringify({ action: 'read', password }) })
+      .then(asJson).then((d) => {
+        input.value = '';
+        const err = {
+          wrong: 'Неверный пароль.',
+          locked: 'Слишком много неверных попыток — вход закрыт на 15 минут.',
+          nopass: 'Пароль ещё не задан: в Apps Script откройте «Настройки проекта → Свойства скрипта» и добавьте TEACHER_PASSWORD.',
+          server: 'Ошибка на сервере: ' + (d.message || ''),
+        }[d.error];
+        if (d.error) { $msg.textContent = err || OLD; return; }
+        rows = (d.rows || []).map(normalize).filter((r) => r.name && r.mode); demo = false; show();
+      }).catch((er) => { $msg.textContent = er.message === 'notjson' ? OLD : NO_LINK; });
+  });
+  document.getElementById('pingBtn').addEventListener('click', () => {
+    if (!CFG.STATS_URL) { $msg.textContent = NO_URL; return; }
+    $msg.textContent = 'Проверяю подключение…';
+    fetch(`${CFG.STATS_URL}?ping=1`).then(asJson).then((d) => {
+      if (!d.version) { $msg.textContent = OLD; return; }
+      if (!d.ok) { $msg.textContent = 'Скрипт работает, но не может открыть таблицу: ' + (d.message || '') + ' Проверьте SPREADSHEET_ID и запустите checkSetup.'; return; }
+      $msg.textContent = `✓ Связь есть, сервер версии ${d.version}. В таблице записей: ${d.rows}.` +
+        (d.password ? '' : ' Но пароль ещё не задан — добавьте свойство TEACHER_PASSWORD в настройках проекта.');
+    }).catch((er) => { $msg.textContent = er.message === 'notjson' ? 'Сервер вернул страницу Google вместо данных — в развертывании укажите доступ «Все».' : NO_LINK; });
   });
   document.getElementById('demoBtn').addEventListener('click', () => { rows = demoRows(); demo = true; show(); });
 
@@ -3525,7 +3553,7 @@ window.TOPICS['v1p5'] = {
     $report.hidden = false;
     const groups = [...new Set(rows.map((r) => r.group))].sort();
     $report.innerHTML = `
-      ${demo ? '<div class="demo-note">Демонстрационные данные — так будет выглядеть отчёт, когда ученики начнут заниматься.</div>' : ''}
+      ${demo ? '<div class="demo-note">Демо-режим: вымышленные ученики, настоящих результатов здесь нет. Так будет выглядеть отчёт, когда ученики начнут заниматься.</div>' : ''}
       <div id="notes"></div>
       <h1>Результаты учеников</h1>
       <div class="filters">
@@ -3533,12 +3561,14 @@ window.TOPICS['v1p5'] = {
         <label>Тема<select id="fTopic"><option value="all">Все темы (сводка по ученикам)</option>${CATALOG.map((v) => `<optgroup label="Том ${v.n}. ${esc(v.title)}">${v.topics.map((t) => `<option value="${t.id}" ${t.id === state.topic ? 'selected' : ''}>§ ${t.n}. ${esc(t.title)}</option>`).join('')}</optgroup>`).join('')}</select></label>
         <label id="modeWrap">Режим<select id="fMode">${TOPIC_MODES.map((k) => [k, modeName[k]]).map(([k, v]) => `<option value="${k}" ${k === state.mode ? 'selected' : ''}>${v}</option>`).join('')}</select></label>
         <button class="btn ghost" id="csvBtn">Скачать CSV</button>
+        <button class="btn ghost" id="outBtn">Выйти</button>
       </div>
       <div id="body"></div>`;
     ['fGroup', 'fTopic', 'fMode'].forEach((id) => document.getElementById(id).addEventListener('change', (e) => {
       state[{ fGroup: 'group', fTopic: 'topic', fMode: 'mode' }[id]] = e.target.value; renderBody();
     }));
     document.getElementById('csvBtn').addEventListener('click', csv);
+    document.getElementById('outBtn').addEventListener('click', () => { rows = []; location.reload(); });
     renderNotes();
     renderBody();
   }
